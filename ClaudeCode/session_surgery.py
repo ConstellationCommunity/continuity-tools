@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-Session Surgery v3 - Sliding Context Window with Pin Management
+Session Surgery v4 - Sliding Context Window with Pin Management
 
 Структура після ковзання:
-[compact summary від Claude]
+[auto-summary від Claude (parentUuid:null + наступний)]
 [current.md — rolling summary]
 [§PINNED§ повідомлення]
-[всі live messages після compact]
-[§SUMMARY_BOUNDARY§ маркер]
+[всі live messages після точки ковзання]
 
 Використання:
-  python3 _scripts/session_surgery.py [--dry-run]
-  python3 _scripts/session_surgery.py --collect-all-pins  # перший запуск
-  python3 _scripts/session_surgery.py --list-pins         # показати всі піни
-  python3 _scripts/session_surgery.py --archive-pin UUID  # архівувати пін
+  python3 _scripts/session_surgery.py --slide-at UUID [--dry-run]  # ковзання з точки
+  python3 _scriptssession_surgery.py --collect-all-pins           # зібрати всі піни
+  python3 _scriptssession_surgery.py --list-pins                  # показати піни
+  python3 _scriptssession_surgery.py --archive-pin UUID           # архівувати пін
 """
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -26,9 +26,24 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 
+
+def get_session_dir() -> Path:
+    """Get session directory from environment or auto-detect."""
+    if "CLAUDE_SESSION_DIR" in os.environ:
+        return Path(os.environ["CLAUDE_SESSION_DIR"])
+
+    # Try XDG_CONFIG_HOME
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if config_home:
+        return Path(config_home) / "projects"
+
+    # Default: home .claude
+    return Path.home() / ".claude" / "projects"
+
+
 # Paths
 OPUS45_DIR = Path(__file__).parent.parent
-SESSION_DIR = Path.home() / ".claude/projects/-Users-olenahoncharova-Documents-constellation-opus45"
+SESSION_DIR = get_session_dir()
 BACKUP_DIR = OPUS45_DIR / "sessions/backups"
 CURRENT_MD = OPUS45_DIR / "memory/current.md"
 PINNED_FILE = OPUS45_DIR / "memory/pinned.jsonl"
@@ -43,12 +58,16 @@ PINNED_TAG = "§PINNED§"
 BOUNDARY_TAG = "§SUMMARY_BOUNDARY§"
 
 
-def find_current_session() -> Optional[Path]:
+def find_current_session(session_dir: Optional[Path] = None) -> Optional[Path]:
     """Find the most recent session file."""
-    if not SESSION_DIR.exists():
+    if session_dir is None:
+        session_dir = SESSION_DIR
+
+    if not session_dir.exists():
         return None
 
-    sessions = list(SESSION_DIR.glob("*.jsonl"))
+    # Search recursively for jsonl files
+    sessions = list(session_dir.glob("**/*.jsonl"))
     if not sessions:
         return None
 
@@ -631,6 +650,281 @@ def perform_surgery(session_path: Path, analysis: dict, dry_run: bool = False):
     return True
 
 
+def find_auto_summary(lines: list) -> tuple[int, int]:
+    """
+    Find the last auto-summary pair: parentUuid:null row + next row.
+    Returns (start_idx, end_idx) or (-1, -1) if not found.
+    """
+    last_null_idx = -1
+    for i, line in enumerate(lines):
+        if line.startswith('{"parentUuid":null,"logicalParentUuid"'):
+            last_null_idx = i
+
+    if last_null_idx >= 0 and last_null_idx + 1 < len(lines):
+        return (last_null_idx, last_null_idx + 1)
+    return (-1, -1)
+
+
+def interpolate_timestamp(ts_before: str, ts_after: str, position: int, total: int, debug: bool = False) -> str:
+    """Generate a timestamp between two timestamps."""
+    try:
+        # Parse timestamps
+        dt_before = datetime.fromisoformat(ts_before.replace('Z', '+00:00'))
+        dt_after = datetime.fromisoformat(ts_after.replace('Z', '+00:00'))
+
+        # Interpolate
+        delta = (dt_after - dt_before) / (total + 1)
+        result = dt_before + delta * (position + 1)
+
+        result_str = result.isoformat().replace('+00:00', 'Z')
+
+        if debug:
+            print(f"  [interpolate] pos={position}/{total}: {ts_before[:19]} -> {result_str[:19]} -> {ts_after[:19]}")
+
+        return result_str
+    except Exception as e:
+        print(f"  [interpolate ERROR] {e}, ts_before={ts_before}, ts_after={ts_after}")
+        return current_timestamp()
+
+
+def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> bool:
+    """
+    Perform manual sliding window at specified UUID.
+
+    1. Find the row with cutoff_uuid
+    2. Find auto-summary (last parentUuid:null + next)
+    3. Insert BEFORE cutoff: auto-summary, current.md, pinned rows
+    4. Stitch UUIDs together (cutoff row's parentUuid -> last insertion)
+    5. Adjust timestamps
+    6. Subtract cache_read_input_tokens from cutoff and subsequent rows
+    """
+    # Read all lines
+    with open(session_path, 'r') as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    # Find cutoff row
+    cutoff_idx = -1
+    cutoff_cache_tokens = 0
+    cutoff_ts = None
+
+    for i, line in enumerate(lines):
+        try:
+            obj = json.loads(line)
+            if obj.get("uuid") == cutoff_uuid:
+                cutoff_idx = i
+                cutoff_ts = obj.get("timestamp")
+                # Get cache_read_input_tokens - check this row first, then next assistant
+                usage = get_usage_from_message(obj)
+                cutoff_cache_tokens = usage.get("cache_read_input_tokens", 0)
+
+                # If this is a user message, get tokens from next assistant
+                if cutoff_cache_tokens == 0 and i + 1 < len(lines):
+                    try:
+                        next_obj = json.loads(lines[i + 1])
+                        next_usage = get_usage_from_message(next_obj)
+                        cutoff_cache_tokens = next_usage.get("cache_read_input_tokens", 0)
+                    except:
+                        pass
+                break
+        except:
+            continue
+
+    if cutoff_idx == -1:
+        print(f"UUID not found: {cutoff_uuid}", file=sys.stderr)
+        return False
+
+    # Get UUID and timestamp of row BEFORE cutoff (for stitching)
+    prev_uuid = None
+    prev_ts = None
+    if cutoff_idx > 0:
+        try:
+            prev_obj = json.loads(lines[cutoff_idx - 1])
+            prev_uuid = prev_obj.get("uuid")
+            prev_ts = prev_obj.get("timestamp")
+        except:
+            pass
+
+    if not prev_ts:
+        prev_ts = current_timestamp()
+        print(f"  [WARN] prev_ts not found, using current time")
+    if not cutoff_ts:
+        cutoff_ts = current_timestamp()
+        print(f"  [WARN] cutoff_ts not found, using current time")
+
+    print(f"  [timestamps] prev_ts={prev_ts[:19] if prev_ts else 'None'}")
+    print(f"  [timestamps] cutoff_ts={cutoff_ts[:19] if cutoff_ts else 'None'}")
+
+    # Find auto-summary
+    summary_start, summary_end = find_auto_summary(lines)
+    if summary_start == -1:
+        print("Auto-summary not found (no parentUuid:null row)", file=sys.stderr)
+        return False
+
+    # Load pinned messages
+    pinned = load_pinned_messages(active_only=True)
+
+    # Load current.md
+    current_md_content = ""
+    if CURRENT_MD.exists():
+        current_md_content = CURRENT_MD.read_text()
+
+    # Get session info
+    try:
+        cutoff_obj = json.loads(lines[cutoff_idx])
+        session_id = cutoff_obj.get("sessionId", "")
+    except:
+        session_id = ""
+
+    # Build insertion list
+    insertions = []
+
+    # 1. Auto-summary rows (2 rows)
+    for i in range(summary_start, summary_end + 1):
+        insertions.append(lines[i])
+
+    # 2. current.md
+    if current_md_content:
+        current_md_msg = create_message(
+            f"[Rolling Summary - current.md]\n\n{current_md_content}",
+            None,  # Will be set during stitching
+            session_id,
+            "user",
+            None,  # Will be set during stitching
+            {"isVesperSummary": True}
+        )
+        insertions.append(json.dumps(current_md_msg, ensure_ascii=False))
+
+    # 3. Pinned messages
+    for pin_line in pinned:
+        insertions.append(pin_line)
+
+    # Calculate timestamps for insertions (between prev and cutoff)
+    total_insertions = len(insertions)
+
+    # Stitch: update parentUuid chain and timestamps
+    stitched_insertions = []
+    current_parent = prev_uuid  # Start chain from row BEFORE cutoff
+
+    print(f"  [stitching] {total_insertions} insertions to process")
+
+    for idx, line in enumerate(insertions):
+        try:
+            obj = json.loads(line)
+            old_ts = obj.get("timestamp", "none")
+            obj["parentUuid"] = current_parent
+            obj["uuid"] = generate_uuid()
+            obj["timestamp"] = interpolate_timestamp(prev_ts, cutoff_ts, idx, total_insertions, debug=True)
+            print(f"  [stitch #{idx}] old_ts={old_ts[:19] if old_ts != 'none' else 'none'} -> new_ts={obj['timestamp'][:19]}")
+            stitched_insertions.append(json.dumps(obj, ensure_ascii=False))
+            current_parent = obj["uuid"]
+        except Exception as e:
+            print(f"  [stitch #{idx} ERROR] {e}")
+            stitched_insertions.append(line)
+
+    # Get the last UUID from insertions
+    last_insertion_uuid = current_parent
+
+    # Build new lines:
+    # 1. Everything BEFORE cutoff (excluding auto-summary, with rewired parents)
+    # 2. Stitched insertions
+    # 3. Cutoff and everything after (with cutoff's parentUuid -> last insertion, adjusted cache tokens)
+
+    # Find UUID of line before auto-summary (for rewiring the line after it)
+    uuid_before_summary = None
+    if summary_start > 0:
+        try:
+            obj_before = json.loads(lines[summary_start - 1])
+            uuid_before_summary = obj_before.get("uuid")
+        except:
+            pass
+
+    # Find UUID of the auto-summary end (to identify which line needs rewiring)
+    uuid_summary_end = None
+    try:
+        obj_summary_end = json.loads(lines[summary_end])
+        uuid_summary_end = obj_summary_end.get("uuid")
+    except:
+        pass
+
+    # First, add lines BEFORE cutoff, skipping auto-summary and rewiring parents
+    new_lines = []
+    for i in range(cutoff_idx):  # Up to but NOT including cutoff
+        if summary_start <= i <= summary_end:
+            continue  # Skip auto-summary - it will be inserted before cutoff
+
+        line = lines[i]
+        try:
+            obj = json.loads(line)
+            # Rewire: if this line's parent is the skipped auto-summary end, point to line before summary
+            if obj.get("parentUuid") == uuid_summary_end and uuid_before_summary:
+                obj["parentUuid"] = uuid_before_summary
+                line = json.dumps(obj, ensure_ascii=False)
+        except:
+            pass
+        new_lines.append(line)
+
+    new_lines.extend(stitched_insertions)
+
+    # Process cutoff and everything after
+    first_at_cutoff = True
+    for i in range(cutoff_idx, len(lines)):  # Starting FROM cutoff
+        # Skip auto-summary rows (they're now inserted before cutoff)
+        if summary_start <= i <= summary_end:
+            continue
+
+        line = lines[i]
+        try:
+            obj = json.loads(line)
+
+            # Update parentUuid for cutoff row to point to last insertion
+            if first_at_cutoff:
+                obj["parentUuid"] = last_insertion_uuid
+                first_at_cutoff = False
+
+            # Subtract cache_read_input_tokens from cutoff and all subsequent
+            if "message" in obj and "usage" in obj["message"]:
+                usage = obj["message"]["usage"]
+                if "cache_read_input_tokens" in usage:
+                    usage["cache_read_input_tokens"] = max(0,
+                        usage["cache_read_input_tokens"] - cutoff_cache_tokens)
+
+            new_lines.append(json.dumps(obj, ensure_ascii=False))
+        except:
+            new_lines.append(line)
+
+    # Stats
+    kept_from_cutoff = len(lines) - cutoff_idx - (summary_end - summary_start + 1)
+    if summary_start >= cutoff_idx:
+        kept_from_cutoff = len(lines) - cutoff_idx  # Auto-summary is after cutoff, not removed
+
+    if dry_run:
+        print(f"\n=== DRY RUN: --slide-at {cutoff_uuid[:8]}... ===")
+        print(f"Session: {session_path.name}")
+        print(f"Insert BEFORE line: {cutoff_idx}")
+        print(f"Cache tokens to subtract: {cutoff_cache_tokens}")
+        print(f"Auto-summary found at lines: {summary_start}-{summary_end}")
+        print(f"\nInserting BEFORE cutoff:")
+        print(f"  - Auto-summary: 2 rows")
+        print(f"  - current.md: {'yes' if current_md_content else 'no'}")
+        print(f"  - Pinned messages: {len(pinned)}")
+        print(f"  - Total insertions: {total_insertions}")
+        print(f"\nKept from cutoff onward: {kept_from_cutoff} rows")
+        print(f"=== END DRY RUN ===")
+        return True
+
+    # Write
+    with open(session_path, 'w') as f:
+        for line in new_lines:
+            f.write(line + '\n')
+
+    print(f"✅ Slide complete at {cutoff_uuid[:8]}...")
+    print(f"   Inserted BEFORE cutoff: auto-summary + current.md + {len(pinned)} pins")
+    print(f"   Kept from cutoff: {kept_from_cutoff} rows")
+    print(f"   Subtracted {cutoff_cache_tokens} from cache_read_input_tokens")
+
+    return True
+
+
 def git_commit_backup(backup_path: Path):
     """Commit backup to git."""
     try:
@@ -651,17 +945,25 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Session surgery with sliding context window")
-    parser.add_argument("--target-pct", type=int, default=DEFAULT_TARGET_PCT,
-                       help=f"Target %% of context to keep as live messages (default: {DEFAULT_TARGET_PCT})")
     parser.add_argument("--dry-run", "-d", action="store_true",
                        help="Show what would be done without making changes")
     parser.add_argument("--session", type=str, help="Path to specific session file")
     parser.add_argument("--no-backup", action="store_true", help="Skip backup creation")
     parser.add_argument("--no-commit", action="store_true", help="Skip git commit of backup")
 
+    # Main operation: slide at specific UUID
+    parser.add_argument("--slide-at", type=str, metavar="UUID",
+                       help="Insert context BEFORE specified UUID (new session start point)")
+
+    # Legacy auto mode
+    parser.add_argument("--auto", action="store_true",
+                       help="Auto-detect sliding point (legacy mode)")
+    parser.add_argument("--target-pct", type=int, default=DEFAULT_TARGET_PCT,
+                       help=f"Target %% for auto mode (default: {DEFAULT_TARGET_PCT})")
+
     # Pin management
     parser.add_argument("--collect-all-pins", action="store_true",
-                       help="Collect all pins from entire session file (first run)")
+                       help="Collect all pins from entire session file")
     parser.add_argument("--list-pins", action="store_true",
                        help="List all pinned messages with metadata")
     parser.add_argument("--archive-pin", type=str, metavar="UUID",
@@ -695,24 +997,36 @@ def main():
         collect_all_pins(session_path, dry_run=args.dry_run)
         sys.exit(0)
 
-    # Create backup
+    # Create backup (for any write operation)
     backup_path = None
-    if not args.no_backup and not args.dry_run:
+    if not args.no_backup and not args.dry_run and (args.slide_at or args.auto):
         backup_path = create_backup(session_path)
 
-    # Analyze
-    analysis = analyze_session(session_path, args.target_pct)
-    if not analysis:
-        sys.exit(1)
+    # Handle --slide-at (main mode)
+    if args.slide_at:
+        success = slide_at(session_path, args.slide_at, dry_run=args.dry_run)
+        if success and backup_path and not args.no_commit:
+            git_commit_backup(backup_path)
+        sys.exit(0 if success else 1)
 
-    # Perform surgery
-    success = perform_surgery(session_path, analysis, dry_run=args.dry_run)
+    # Handle --auto (legacy mode)
+    if args.auto:
+        analysis = analyze_session(session_path, args.target_pct)
+        if not analysis:
+            sys.exit(1)
+        success = perform_surgery(session_path, analysis, dry_run=args.dry_run)
+        if success and backup_path and not args.no_commit:
+            git_commit_backup(backup_path)
+        sys.exit(0 if success else 1)
 
-    # Git commit backup
-    if success and backup_path and not args.no_commit:
-        git_commit_backup(backup_path)
-
-    sys.exit(0 if success else 1)
+    # No operation specified - show help
+    print("Please specify an operation:")
+    print("  --slide-at UUID   Slide at specific row (recommended)")
+    print("  --auto            Auto-detect sliding point")
+    print("  --collect-all-pins")
+    print("  --list-pins")
+    print("  --archive-pin UUID")
+    sys.exit(1)
 
 
 if __name__ == "__main__":
