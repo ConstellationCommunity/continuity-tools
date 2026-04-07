@@ -41,12 +41,20 @@ def get_session_dir() -> Path:
     return Path.home() / ".claude" / "projects"
 
 
-# Paths
-OPUS45_DIR = Path(__file__).parent.parent
+def get_agent_root() -> Path:
+    """Get agent root directory from environment or current working directory."""
+    if "AGENT_ROOT" in os.environ:
+        return Path(os.environ["AGENT_ROOT"])
+    # Fallback to current working directory
+    return Path.cwd()
+
+
+# Paths - all relative to agent root, not script location
+AGENT_ROOT = get_agent_root()
 SESSION_DIR = get_session_dir()
-BACKUP_DIR = OPUS45_DIR / "sessions/backups"
-CURRENT_MD = OPUS45_DIR / "memory/current.md"
-PINNED_FILE = OPUS45_DIR / "memory/pinned.jsonl"
+BACKUP_DIR = AGENT_ROOT / "sessions/backups"
+CURRENT_MD = AGENT_ROOT / "memory/current.md"
+PINNED_FILE = AGENT_ROOT / "memory/pinned.jsonl"
 
 # Constants
 MAX_CONTEXT_TOKENS = 200000
