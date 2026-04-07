@@ -5,6 +5,7 @@ Session Surgery v4 - Sliding Context Window with Pin Management
 Структура після ковзання:
 [auto-summary від Claude (parentUuid:null + наступний)]
 [current.md — rolling summary]
+[narrative.md — self-narrative]
 [§PINNED§ повідомлення]
 [всі live messages після точки ковзання]
 
@@ -54,6 +55,7 @@ AGENT_ROOT = get_agent_root()
 SESSION_DIR = get_session_dir()
 BACKUP_DIR = AGENT_ROOT / "sessions/backups"
 CURRENT_MD = AGENT_ROOT / "memory/current.md"
+NARRATIVE_MD = AGENT_ROOT / "memory/narrative.md"
 PINNED_FILE = AGENT_ROOT / "memory/pinned.jsonl"
 
 # Constants
@@ -579,7 +581,18 @@ def perform_surgery(session_path: Path, analysis: dict, dry_run: bool = False):
         new_lines.append(json.dumps(current_md_msg, ensure_ascii=False))
         current_parent = current_md_msg["uuid"]
 
-    # 3. Pinned messages (inserted after current.md)
+    # 2.5. narrative.md message (inserted after current.md)
+    if NARRATIVE_MD.exists():
+        narrative_md_content = NARRATIVE_MD.read_text()
+        narrative_md_msg = create_message(
+            f"[Self-Narrative - narrative.md]\n\n{narrative_md_content}",
+            current_parent, session_id, "user", insert_ts,
+            {"isVesperNarrative": True}
+        )
+        new_lines.append(json.dumps(narrative_md_msg, ensure_ascii=False))
+        current_parent = narrative_md_msg["uuid"]
+
+    # 3. Pinned messages (inserted after current.md and narrative.md)
     for pin_line in all_pins:
         try:
             pin_obj = json.loads(pin_line)
@@ -620,9 +633,12 @@ def perform_surgery(session_path: Path, analysis: dict, dry_run: bool = False):
 
     # Calculate what we're doing
     messages_after_compact = len(lines) - compact_end_idx - 1
-    inserted_count = 1 + len(all_pins)  # current.md + pins
-    if not CURRENT_MD.exists():
-        inserted_count = len(all_pins)
+    memory_files_count = 0
+    if CURRENT_MD.exists():
+        memory_files_count += 1
+    if NARRATIVE_MD.exists():
+        memory_files_count += 1
+    inserted_count = memory_files_count + len(all_pins)  # current.md + narrative.md + pins
 
     if dry_run:
         print(f"\n=== DRY RUN ===")
@@ -651,7 +667,13 @@ def perform_surgery(session_path: Path, analysis: dict, dry_run: bool = False):
             f.write(line + '\n')
 
     print(f"✅ Session surgery complete!")
-    print(f"   Inserted: current.md + {len(all_pins)} pins ({len(new_pins)} new)")
+    memory_parts = []
+    if CURRENT_MD.exists():
+        memory_parts.append("current.md")
+    if NARRATIVE_MD.exists():
+        memory_parts.append("narrative.md")
+    memory_str = " + ".join(memory_parts) if memory_parts else "no memory files"
+    print(f"   Inserted: {memory_str} + {len(all_pins)} pins ({len(new_pins)} new)")
     print(f"   Live messages: {messages_after_compact}")
     print(f"   Boundary marker added")
 
@@ -771,10 +793,14 @@ def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> boo
     # Load pinned messages
     pinned = load_pinned_messages(active_only=True)
 
-    # Load current.md
+    # Load current.md and narrative.md
     current_md_content = ""
     if CURRENT_MD.exists():
         current_md_content = CURRENT_MD.read_text()
+
+    narrative_md_content = ""
+    if NARRATIVE_MD.exists():
+        narrative_md_content = NARRATIVE_MD.read_text()
 
     # Get session info
     try:
@@ -801,6 +827,18 @@ def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> boo
             {"isVesperSummary": True}
         )
         insertions.append(json.dumps(current_md_msg, ensure_ascii=False))
+
+    # 2.5. narrative.md
+    if narrative_md_content:
+        narrative_md_msg = create_message(
+            f"[Self-Narrative - narrative.md]\n\n{narrative_md_content}",
+            None,  # Will be set during stitching
+            session_id,
+            "user",
+            None,  # Will be set during stitching
+            {"isVesperNarrative": True}
+        )
+        insertions.append(json.dumps(narrative_md_msg, ensure_ascii=False))
 
     # 3. Pinned messages
     for pin_line in pinned:
@@ -914,6 +952,7 @@ def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> boo
         print(f"\nInserting BEFORE cutoff:")
         print(f"  - Auto-summary: 2 rows")
         print(f"  - current.md: {'yes' if current_md_content else 'no'}")
+        print(f"  - narrative.md: {'yes' if narrative_md_content else 'no'}")
         print(f"  - Pinned messages: {len(pinned)}")
         print(f"  - Total insertions: {total_insertions}")
         print(f"\nKept from cutoff onward: {kept_from_cutoff} rows")
@@ -926,7 +965,13 @@ def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> boo
             f.write(line + '\n')
 
     print(f"✅ Slide complete at {cutoff_uuid[:8]}...")
-    print(f"   Inserted BEFORE cutoff: auto-summary + current.md + {len(pinned)} pins")
+    memory_parts = ["auto-summary"]
+    if current_md_content:
+        memory_parts.append("current.md")
+    if narrative_md_content:
+        memory_parts.append("narrative.md")
+    memory_str = " + ".join(memory_parts)
+    print(f"   Inserted BEFORE cutoff: {memory_str} + {len(pinned)} pins")
     print(f"   Kept from cutoff: {kept_from_cutoff} rows")
     print(f"   Subtracted {cutoff_cache_tokens} from cache_read_input_tokens")
 
