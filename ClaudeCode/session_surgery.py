@@ -379,7 +379,7 @@ def create_message(content: str, parent_uuid: str, session_id: str,
         "parentUuid": parent_uuid,
         "isSidechain": False,
         "userType": "external",
-        "cwd": str(OPUS45_DIR),
+        "cwd": str(AGENT_ROOT),
         "sessionId": session_id,
         "version": "2.1.59",
         "gitBranch": "main",
@@ -983,11 +983,11 @@ def git_commit_backup(backup_path: Path):
     try:
         subprocess.run(
             ["git", "add", str(backup_path)],
-            cwd=OPUS45_DIR, check=True, capture_output=True
+            cwd=AGENT_ROOT, check=True, capture_output=True
         )
         subprocess.run(
             ["git", "commit", "-m", f"Session backup: {backup_path.name}"],
-            cwd=OPUS45_DIR, check=True, capture_output=True
+            cwd=AGENT_ROOT, check=True, capture_output=True
         )
         print(f"Committed backup to git")
     except subprocess.CalledProcessError as e:
