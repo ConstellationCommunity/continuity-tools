@@ -54,6 +54,8 @@ AGENT_ROOT = get_agent_root()
 SESSION_DIR = get_session_dir()
 BACKUP_DIR = AGENT_ROOT / "sessions/backups"
 CURRENT_MD = AGENT_ROOT / "memory/current.md"
+NARRATIVE_MD = AGENT_ROOT / "memory/narrative.md"
+JOURNAL_FILE = AGENT_ROOT / "memory/journal.jsonl"
 PINNED_FILE = AGENT_ROOT / "memory/pinned.jsonl"
 
 # Constants
@@ -728,6 +730,25 @@ def find_auto_summary(lines: list) -> tuple[int, int]:
     return (start_idx, end_idx)
 
 
+def archive_to_journal(current_md_content: str):
+    """Archive current.md content to journal.jsonl before sliding."""
+    if not current_md_content.strip():
+        return
+
+    entry = {
+        "timestamp": current_timestamp(),
+        "type": "rolling_summary",
+        "content": current_md_content
+    }
+
+    JOURNAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(JOURNAL_FILE, 'a') as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+    print(f"  [journal] Archived rolling summary to {JOURNAL_FILE.name}")
+
+
 def interpolate_timestamp(ts_before: str, ts_after: str, position: int, total: int, debug: bool = False) -> str:
     """Generate a timestamp between two timestamps."""
     try:
@@ -796,12 +817,23 @@ def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> boo
         print(f"UUID not found: {cutoff_uuid}", file=sys.stderr)
         return False
 
-    # Get UUID and timestamp of row BEFORE cutoff (for stitching)
+    if not cutoff_ts:
+        cutoff_ts = current_timestamp()
+        print(f"  [WARN] cutoff_ts not found, using current time")
+
+    # Find auto-summary FIRST (we need to know where it is to get correct prev_ts)
+    summary_start, summary_end = find_auto_summary(lines)
+    if summary_start == -1:
+        print("Auto-summary not found (no parentUuid:null row)", file=sys.stderr)
+        return False
+
+    # Get UUID and timestamp of row BEFORE the auto-summary block
+    # This is the anchor point for stitching timestamps
     prev_uuid = None
     prev_ts = None
-    if cutoff_idx > 0:
+    if summary_start > 0:
         try:
-            prev_obj = json.loads(lines[cutoff_idx - 1])
+            prev_obj = json.loads(lines[summary_start - 1])
             prev_uuid = prev_obj.get("uuid")
             prev_ts = prev_obj.get("timestamp")
         except:
@@ -810,18 +842,9 @@ def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> boo
     if not prev_ts:
         prev_ts = current_timestamp()
         print(f"  [WARN] prev_ts not found, using current time")
-    if not cutoff_ts:
-        cutoff_ts = current_timestamp()
-        print(f"  [WARN] cutoff_ts not found, using current time")
 
-    print(f"  [timestamps] prev_ts={prev_ts[:19] if prev_ts else 'None'}")
-    print(f"  [timestamps] cutoff_ts={cutoff_ts[:19] if cutoff_ts else 'None'}")
-
-    # Find auto-summary
-    summary_start, summary_end = find_auto_summary(lines)
-    if summary_start == -1:
-        print("Auto-summary not found (no parentUuid:null row)", file=sys.stderr)
-        return False
+    print(f"  [timestamps] prev_ts={prev_ts[:19] if prev_ts else 'None'} (row before summary)")
+    print(f"  [timestamps] cutoff_ts={cutoff_ts[:19] if cutoff_ts else 'None'} (cutoff row)")
 
     # Load pinned messages
     pinned = load_pinned_messages(active_only=True)
@@ -830,6 +853,15 @@ def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> boo
     current_md_content = ""
     if CURRENT_MD.exists():
         current_md_content = CURRENT_MD.read_text()
+
+    # Load narrative.md (if exists)
+    narrative_content = ""
+    if NARRATIVE_MD.exists():
+        narrative_content = NARRATIVE_MD.read_text()
+
+    # Archive current.md to journal.jsonl before sliding
+    if current_md_content and not dry_run:
+        archive_to_journal(current_md_content)
 
     # Get session info
     try:
@@ -845,7 +877,7 @@ def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> boo
     for i in range(summary_start, summary_end + 1):
         insertions.append(lines[i])
 
-    # 2. current.md
+    # 2. current.md (Rolling Summary)
     if current_md_content:
         current_md_msg = create_message(
             f"[Rolling Summary - current.md]\n\n{current_md_content}",
@@ -857,7 +889,19 @@ def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> boo
         )
         insertions.append(json.dumps(current_md_msg, ensure_ascii=False))
 
-    # 3. Pinned messages
+    # 3. narrative.md (Self-Narrative, if exists)
+    if narrative_content:
+        narrative_msg = create_message(
+            f"[Self-Narrative - narrative.md]\n\n{narrative_content}",
+            None,  # Will be set during stitching
+            session_id,
+            "user",
+            None,  # Will be set during stitching
+            {"isVesperNarrative": True}
+        )
+        insertions.append(json.dumps(narrative_msg, ensure_ascii=False))
+
+    # 4. Pinned messages
     for pin_line in pinned:
         insertions.append(pin_line)
 
@@ -866,7 +910,7 @@ def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> boo
 
     # Stitch: update parentUuid chain and timestamps
     stitched_insertions = []
-    current_parent = prev_uuid  # Start chain from row BEFORE cutoff
+    current_parent = prev_uuid  # Start chain from row BEFORE summary
 
     print(f"  [stitching] {total_insertions} insertions to process")
 
