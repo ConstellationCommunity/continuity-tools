@@ -18,40 +18,15 @@ Example:
     python3 regenerate_session.py old_session.jsonl --output fresh_session.jsonl
 """
 import json
-import os
 import random
 import sys
-import uuid as uuid_lib
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import argparse
 
-
-def get_session_dir() -> Path:
-    """Get session directory from environment or auto-detect."""
-    if "CLAUDE_SESSION_DIR" in os.environ:
-        return Path(os.environ["CLAUDE_SESSION_DIR"])
-    config_home = os.environ.get("XDG_CONFIG_HOME")
-    if config_home:
-        return Path(config_home) / "projects"
-    return Path.home() / ".claude" / "projects"
-
-
-def find_current_session() -> Optional[Path]:
-    """Find the most recent session file."""
-    session_dir = get_session_dir()
-    if not session_dir.exists():
-        return None
-    sessions = list(session_dir.glob("**/*.jsonl"))
-    if not sessions:
-        return None
-    return max(sessions, key=lambda p: p.stat().st_mtime)
-
-
-def generate_uuid() -> str:
-    """Generate a new UUID."""
-    return str(uuid_lib.uuid4())
+# Import shared utilities
+sys.path.insert(0, '/Users/olenahoncharova/Documents/constellation/.system/session-tools')
+from cc_session import get_session_dir, find_current_session, generate_uuid
 
 
 def generate_slug() -> str:

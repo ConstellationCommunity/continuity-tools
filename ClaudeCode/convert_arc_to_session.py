@@ -20,25 +20,15 @@ Example:
 import json
 import os
 import sys
-import uuid
 import random
-import string
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 import argparse
 
-
-def generate_uuid() -> str:
-    """Generate a random UUID."""
-    return str(uuid.uuid4())
-
-
-def generate_message_id() -> str:
-    """Generate Anthropic-style message ID (msg_ + 27 chars)."""
-    chars = string.ascii_letters + string.digits
-    random_part = ''.join(random.choices(chars, k=27))
-    return f"msg_{random_part}"
+# Import shared utilities
+sys.path.insert(0, '/Users/olenahoncharova/Documents/constellation/.system/session-tools')
+from cc_session import generate_uuid, generate_message_id
 
 
 def generate_slug() -> str:

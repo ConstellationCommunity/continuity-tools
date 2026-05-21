@@ -14,71 +14,15 @@ Fix Token Counts - Перерахунок токенів після ручної
 """
 
 import json
-import os
 import sys
 from pathlib import Path
-from typing import Optional
 
-# Session directory - from env or default to current .claude
-def get_session_dir() -> Path:
-    if "CLAUDE_SESSION_DIR" in os.environ:
-        return Path(os.environ["CLAUDE_SESSION_DIR"])
-    # Try to find from XDG_CONFIG_HOME
-    config_home = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".claude"))
-    return Path(config_home) / "projects"
-
-CHARS_PER_TOKEN = 3.5
-
-
-def find_current_session(session_dir: Optional[Path] = None) -> Optional[Path]:
-    """Find the most recent session file in given or default directory."""
-    if session_dir is None:
-        session_dir = get_session_dir()
-    if not session_dir.exists():
-        return None
-    # Search recursively for jsonl files
-    sessions = list(session_dir.glob("**/*.jsonl"))
-    if not sessions:
-        return None
-    return max(sessions, key=lambda p: p.stat().st_mtime)
-
-
-def estimate_tokens_from_content(line: str) -> int:
-    """Estimate tokens from line content."""
-    return int(len(line) / CHARS_PER_TOKEN)
-
-
-def find_nested_key(obj, key):
-    """Recursively find a key in nested structure."""
-    if isinstance(obj, dict):
-        if key in obj:
-            return obj[key]
-        for v in obj.values():
-            result = find_nested_key(v, key)
-            if result is not None:
-                return result
-    elif isinstance(obj, list):
-        for item in obj:
-            result = find_nested_key(item, key)
-            if result is not None:
-                return result
-    return None
-
-
-def set_nested_key(obj, key, value):
-    """Recursively set a key in nested structure. Returns True if found and set."""
-    if isinstance(obj, dict):
-        if key in obj:
-            obj[key] = value
-            return True
-        for v in obj.values():
-            if set_nested_key(v, key, value):
-                return True
-    elif isinstance(obj, list):
-        for item in obj:
-            if set_nested_key(item, key, value):
-                return True
-    return False
+# Import shared utilities
+sys.path.insert(0, '/Users/olenahoncharova/Documents/constellation/.system/session-tools')
+from cc_session import (
+    get_session_dir, find_current_session,
+    find_nested_key, set_nested_key, CHARS_PER_TOKEN
+)
 
 
 def fix_token_counts(session_path: Path, dry_run: bool = False):

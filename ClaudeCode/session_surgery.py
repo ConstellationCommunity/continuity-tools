@@ -21,32 +21,18 @@ import re
 import shutil
 import subprocess
 import sys
-import uuid as uuid_lib
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
-
-def get_session_dir() -> Path:
-    """Get session directory from environment or auto-detect."""
-    if "CLAUDE_SESSION_DIR" in os.environ:
-        return Path(os.environ["CLAUDE_SESSION_DIR"])
-
-    # Try XDG_CONFIG_HOME
-    config_home = os.environ.get("XDG_CONFIG_HOME")
-    if config_home:
-        return Path(config_home) / "projects"
-
-    # Default: home .claude
-    return Path.home() / ".claude" / "projects"
-
-
-def get_agent_root() -> Path:
-    """Get agent root directory from environment or current working directory."""
-    if "AGENT_ROOT" in os.environ:
-        return Path(os.environ["AGENT_ROOT"])
-    # Fallback to current working directory
-    return Path.cwd()
+# Import shared utilities
+sys.path.insert(0, '/Users/olenahoncharova/Documents/constellation/.system/session-tools')
+from cc_session import (
+    get_session_dir, get_agent_root, find_current_session,
+    generate_uuid, current_timestamp, estimate_tokens,
+    find_nested_key, get_content, get_usage, interpolate_timestamp,
+    create_message, CHARS_PER_TOKEN, MAX_CONTEXT_TOKENS
+)
 
 
 # Paths - all relative to agent root, not script location
@@ -58,78 +44,12 @@ NARRATIVE_MD = AGENT_ROOT / "memory/narrative.md"
 JOURNAL_FILE = AGENT_ROOT / "memory/journal.jsonl"
 PINNED_FILE = AGENT_ROOT / "memory/pinned.jsonl"
 
-# Constants
-MAX_CONTEXT_TOKENS = 200000
+# Constants (some imported from cc_session)
 DEFAULT_TARGET_PCT = 50  # Keep ~50% of context as live messages
-CHARS_PER_TOKEN = 3.5  # Approximate for mixed Ukrainian/English
 
 PIN_TAG = "§PIN§"
 PINNED_TAG = "§PINNED§"
 BOUNDARY_TAG = "§SUMMARY_BOUNDARY§"
-
-
-def find_current_session(session_dir: Optional[Path] = None) -> Optional[Path]:
-    """Find the most recent session file."""
-    if session_dir is None:
-        session_dir = SESSION_DIR
-
-    if not session_dir.exists():
-        return None
-
-    # Search recursively for jsonl files
-    sessions = list(session_dir.glob("**/*.jsonl"))
-    if not sessions:
-        return None
-
-    return max(sessions, key=lambda p: p.stat().st_mtime)
-
-
-def generate_uuid() -> str:
-    """Generate a new UUID."""
-    return str(uuid_lib.uuid4())
-
-
-def current_timestamp() -> str:
-    """Generate current timestamp in ISO format."""
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def estimate_tokens(text: str) -> int:
-    """Estimate token count from text."""
-    return int(len(text) / CHARS_PER_TOKEN)
-
-
-def find_nested_key(obj, key):
-    """Recursively find a key in nested structure."""
-    if isinstance(obj, dict):
-        if key in obj:
-            return obj[key]
-        for v in obj.values():
-            result = find_nested_key(v, key)
-            if result is not None:
-                return result
-    elif isinstance(obj, list):
-        for item in obj:
-            result = find_nested_key(item, key)
-            if result is not None:
-                return result
-    return None
-
-
-def get_content(obj: dict) -> str:
-    """Extract text content from a message object."""
-    content = find_nested_key(obj, "content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        texts = []
-        for block in content:
-            if isinstance(block, dict) and "text" in block:
-                texts.append(block["text"])
-            elif isinstance(block, str):
-                texts.append(block)
-        return "\n".join(texts)
-    return ""
 
 
 def get_usage_from_message(obj: dict) -> dict:
@@ -369,31 +289,6 @@ def create_backup(session_path: Path) -> Path:
     print(f"Backup: {backup_path}")
 
     return backup_path
-
-
-def create_message(content: str, parent_uuid: str, session_id: str,
-                   msg_type: str = "user", timestamp: str = None,
-                   extra_fields: dict = None) -> dict:
-    """Create a message record."""
-    msg = {
-        "parentUuid": parent_uuid,
-        "isSidechain": False,
-        "userType": "external",
-        "cwd": str(AGENT_ROOT),
-        "sessionId": session_id,
-        "version": "2.1.59",
-        "gitBranch": "main",
-        "type": msg_type,
-        "message": {
-            "role": msg_type,
-            "content": content
-        },
-        "uuid": generate_uuid(),
-        "timestamp": timestamp or current_timestamp()
-    }
-    if extra_fields:
-        msg.update(extra_fields)
-    return msg
 
 
 def analyze_session(session_path: Path, target_pct: int = DEFAULT_TARGET_PCT) -> dict:
@@ -717,28 +612,6 @@ def archive_to_journal(current_md_content: str):
         f.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
     print(f"  [journal] Archived rolling summary to {JOURNAL_FILE.name}")
-
-
-def interpolate_timestamp(ts_before: str, ts_after: str, position: int, total: int, debug: bool = False) -> str:
-    """Generate a timestamp between two timestamps."""
-    try:
-        # Parse timestamps
-        dt_before = datetime.fromisoformat(ts_before.replace('Z', '+00:00'))
-        dt_after = datetime.fromisoformat(ts_after.replace('Z', '+00:00'))
-
-        # Interpolate
-        delta = (dt_after - dt_before) / (total + 1)
-        result = dt_before + delta * (position + 1)
-
-        result_str = result.isoformat().replace('+00:00', 'Z')
-
-        if debug:
-            print(f"  [interpolate] pos={position}/{total}: {ts_before[:19]} -> {result_str[:19]} -> {ts_after[:19]}")
-
-        return result_str
-    except Exception as e:
-        print(f"  [interpolate ERROR] {e}, ts_before={ts_before}, ts_after={ts_after}")
-        return current_timestamp()
 
 
 def slide_at(session_path: Path, cutoff_uuid: str, dry_run: bool = False) -> bool:

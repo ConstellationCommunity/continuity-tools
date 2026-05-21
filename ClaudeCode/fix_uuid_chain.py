@@ -6,40 +6,13 @@ Traverses from the last line back to session start (parentUuid: null),
 checking that each parentUuid matches the uuid of the nearest preceding line.
 """
 
-import json
 import argparse
 import sys
 from pathlib import Path
 
-
-def load_session(filepath: Path) -> list[dict]:
-    """Load session file as list of parsed JSON objects."""
-    lines = []
-    with open(filepath, 'r', encoding='utf-8') as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                obj['_line_num'] = line_num
-                obj['_raw'] = line
-                lines.append(obj)
-            except json.JSONDecodeError as e:
-                print(f"Warning: Could not parse line {line_num}: {e}")
-    return lines
-
-
-def find_session_start(lines: list[dict], from_index: int) -> int:
-    """
-    Find the start of the current session (line with parentUuid: null).
-    Search backwards from from_index.
-    Session start must have 'parentUuid' key with value null (not just missing key).
-    """
-    for i in range(from_index, -1, -1):
-        if 'parentUuid' in lines[i] and lines[i]['parentUuid'] is None:
-            return i
-    return 0
+# Import shared utilities
+sys.path.insert(0, '/Users/olenahoncharova/Documents/constellation/.system/session-tools')
+from cc_session import load_session, save_session, find_session_start
 
 
 def find_nearest_uuid_before(lines: list[dict], index: int) -> tuple[str | None, int | None]:
@@ -91,15 +64,6 @@ def check_and_fix_chain(lines: list[dict], start_index: int, dry_run: bool = Tru
                 lines[i]['parentUuid'] = expected_parent
 
     return fixes
-
-
-def save_session(filepath: Path, lines: list[dict]):
-    """Save session back to file."""
-    with open(filepath, 'w', encoding='utf-8') as f:
-        for obj in lines:
-            # Remove our internal fields
-            clean_obj = {k: v for k, v in obj.items() if not k.startswith('_')}
-            f.write(json.dumps(clean_obj, ensure_ascii=False) + '\n')
 
 
 def main():

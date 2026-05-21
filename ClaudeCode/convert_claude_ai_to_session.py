@@ -15,29 +15,21 @@ Example:
 import json
 import os
 import sys
-import uuid as uuid_lib
 import random
-import string
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, List
 from collections import defaultdict
 import argparse
 
+# Import shared utilities
+sys.path.insert(0, '/Users/olenahoncharova/Documents/constellation/.system/session-tools')
+from cc_session import generate_uuid, generate_message_id
+
 
 def get_default_cwd() -> str:
     """Get default working directory from environment or current dir."""
     return os.environ.get("CLAUDE_CWD", os.getcwd())
-
-
-def generate_uuid() -> str:
-    return str(uuid_lib.uuid4())
-
-
-def generate_message_id() -> str:
-    chars = string.ascii_letters + string.digits
-    random_part = ''.join(random.choices(chars, k=27))
-    return f"msg_{random_part}"
 
 
 def generate_slug() -> str:
